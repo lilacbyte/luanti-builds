@@ -1,0 +1,381 @@
+name: Build Luanti Latest Release
+
+on:
+  schedule:
+    - cron: '13 4 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional upstream Luanti version/tag (e.g. 5.15.2 or v5.15.2)"
+        required: false
+        type: string
+      force:
+        description: "Force rebuild/release even if local release tag already exists"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: luanti-release-sync
+  cancel-in-progress: false
+
+jobs:
+  check-upstream:
+    name: Check upstream Luanti release
+    runs-on: ubuntu-22.04
+
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      tarball_url: ${{ steps.check.outputs.tarball_url }}
+
+    steps:
+      - name: Resolve target version and build decision
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_FORCE: ${{ github.event.inputs.force }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          input_version="${INPUT_VERSION:-}"
+          input_force="${INPUT_FORCE:-}"
+
+          if [ -n "$input_version" ]; then
+            if [[ "$input_version" == v* ]]; then
+              try_tag_1="$input_version"
+              try_tag_2="${input_version#v}"
+            else
+              try_tag_1="v$input_version"
+              try_tag_2="$input_version"
+            fi
+
+            api_json=""
+            if api_json="$(curl -fsSL "https://api.github.com/repos/luanti-org/luanti/releases/tags/$try_tag_1" 2>/dev/null)"; then
+              upstream_tag="$try_tag_1"
+            elif api_json="$(curl -fsSL "https://api.github.com/repos/luanti-org/luanti/releases/tags/$try_tag_2" 2>/dev/null)"; then
+              upstream_tag="$try_tag_2"
+            else
+              echo "ERROR: Could not find upstream release for input '$input_version'" >&2
+              exit 1
+            fi
+          else
+            api_json="$(curl -fsSL https://api.github.com/repos/luanti-org/luanti/releases/latest)"
+            upstream_tag="$(jq -r '.tag_name' <<<"$api_json")"
+          fi
+
+          tarball_url="$(jq -r '.tarball_url' <<<"$api_json")"
+          version="${upstream_tag#v}"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            force="${input_force:-true}"
+          else
+            force="${input_force:-false}"
+          fi
+
+          should_build="false"
+          reason="release already exists"
+
+          if [ "$force" = "true" ]; then
+            should_build="true"
+            reason="forced run"
+          elif gh release view "$version" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            should_build="false"
+            reason="local release $version already exists"
+          else
+            should_build="true"
+            reason="new upstream release"
+          fi
+
+          echo "Target upstream tag: $upstream_tag"
+          echo "Local tag/version: $version"
+          echo "Decision: should_build=$should_build ($reason)"
+
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "tarball_url=$tarball_url" >> "$GITHUB_OUTPUT"
+
+  build-server:
+    name: Build server (executable)
+    runs-on: ubuntu-22.04
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+
+    outputs:
+      version: ${{ needs.check-upstream.outputs.version }}
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config curl ca-certificates \
+            zlib1g-dev libsqlite3-dev libzstd-dev libgmp-dev \
+            libluajit-5.1-dev libcurl4-gnutls-dev libncurses-dev
+
+      - name: Fetch target Luanti release source
+        run: |
+          set -euo pipefail
+          curl -fsSL "${{ needs.check-upstream.outputs.tarball_url }}" -o luanti.tar.gz
+          tar -xzf luanti.tar.gz
+          src_dir="$(find . -maxdepth 1 -type d -name 'luanti-org-luanti-*' | head -n1)"
+          if [ -z "$src_dir" ]; then
+            echo "ERROR: extracted source directory not found" >&2
+            exit 1
+          fi
+          echo "SRC_DIR=$src_dir" >> "$GITHUB_ENV"
+
+      - name: Configure (server-only)
+        run: |
+          cmake -S "$SRC_DIR" -B build-server \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRUN_IN_PLACE=FALSE \
+            -DEXECUTABLE_OUTPUT_PATH="$PWD/build-server/bin" \
+            -DBUILD_SERVER=TRUE \
+            -DBUILD_CLIENT=FALSE \
+            -DBUILD_UNITTESTS=FALSE \
+            -DBUILD_BENCHMARKS=FALSE \
+            -DBUILD_DOCUMENTATION=FALSE \
+            -DENABLE_LEVELDB=OFF \
+            -DENABLE_POSTGRESQL=OFF \
+            -DENABLE_REDIS=OFF \
+            -DENABLE_SPATIAL=OFF \
+            -DENABLE_PROMETHEUS=OFF \
+            -DENABLE_CURSES=ON \
+            -DENABLE_SOUND=OFF \
+            -DENABLE_SYSTEM_JSONCPP=OFF \
+            -DENABLE_SYSTEM_GMP=OFF \
+            -DJSON_LIBRARY=jsoncpp \
+            -DJSON_INCLUDE_DIR="$SRC_DIR/lib/jsoncpp"
+
+      - name: Build
+        run: cmake --build build-server --parallel 2
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/server
+          server_bin=""
+          for cand in \
+            build-server/bin/luantiserver \
+            build-server/bin/minetestserver \
+            "$SRC_DIR/bin/luantiserver" \
+            "$SRC_DIR/bin/minetestserver"; do
+            if [ -f "$cand" ]; then
+              server_bin="$cand"
+              break
+            fi
+          done
+
+          if [ -z "$server_bin" ]; then
+            echo "ERROR: missing required artifact: server executable" >&2
+            echo "Expected candidates checked under build-server/bin and \$SRC_DIR/bin" >&2
+            echo "build-server files:" >&2
+            find build-server -type f | sort >&2
+            echo "source tree bin files:" >&2
+            find "$SRC_DIR" -maxdepth 4 -type f -path '*/bin/*' | sort >&2
+            exit 1
+          fi
+
+          cp -v "$server_bin" artifacts/server/luantiserver
+
+      - name: Verify server runtime dependencies
+        run: |
+          set -euo pipefail
+          echo "ldd artifacts/server/luantiserver:"
+          ldd artifacts/server/luantiserver || true
+
+          if ldd artifacts/server/luantiserver | rg -q 'libjsoncpp'; then
+            echo "ERROR: luantiserver still links libjsoncpp dynamically; refusing to publish broken standalone binary." >&2
+            exit 1
+          fi
+
+      - name: Upload server artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: luanti-server-${{ needs.check-upstream.outputs.version }}-linux
+          path: artifacts/server
+          if-no-files-found: error
+
+  build-desktop:
+    name: Build desktop (executable + .deb)
+    runs-on: ubuntu-22.04
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+
+    outputs:
+      version: ${{ needs.check-upstream.outputs.version }}
+
+    steps:
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config curl ca-certificates \
+            libpng-dev libjpeg-dev libgl1-mesa-dev libsqlite3-dev \
+            libogg-dev libvorbis-dev libopenal-dev libcurl4-gnutls-dev \
+            libfreetype6-dev zlib1g-dev libgmp-dev libjsoncpp-dev \
+            libzstd-dev libluajit-5.1-dev gettext libsdl2-dev \
+            dpkg-dev
+
+      - name: Fetch target Luanti release source
+        run: |
+          set -euo pipefail
+          curl -fsSL "${{ needs.check-upstream.outputs.tarball_url }}" -o luanti.tar.gz
+          tar -xzf luanti.tar.gz
+          src_dir="$(find . -maxdepth 1 -type d -name 'luanti-org-luanti-*' | head -n1)"
+          if [ -z "$src_dir" ]; then
+            echo "ERROR: extracted source directory not found" >&2
+            exit 1
+          fi
+          echo "SRC_DIR=$src_dir" >> "$GITHUB_ENV"
+
+      - name: Configure (desktop)
+        run: |
+          cmake -S "$SRC_DIR" -B build-desktop \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/opt/luanti-upstream \
+            -DRUN_IN_PLACE=FALSE \
+            -DEXECUTABLE_OUTPUT_PATH="$PWD/build-desktop/bin" \
+            -DBUILD_CLIENT=TRUE \
+            -DBUILD_SERVER=FALSE \
+            -DBUILD_UNITTESTS=FALSE \
+            -DBUILD_BENCHMARKS=FALSE \
+            -DBUILD_DOCUMENTATION=FALSE \
+            -DENABLE_LEVELDB=OFF \
+            -DENABLE_POSTGRESQL=OFF \
+            -DENABLE_REDIS=OFF \
+            -DENABLE_SPATIAL=OFF \
+            -DENABLE_PROMETHEUS=OFF \
+            -DCPACK_DEBIAN_PACKAGE_SHLIBDEPS=ON \
+            -DCPACK_DEBIAN_PACKAGE_NAME=luanti-upstream \
+            -DCPACK_PACKAGE_FILE_NAME=luanti-${{ needs.check-upstream.outputs.version }} \
+            -DCUSTOM_BINDIR=/opt/luanti-upstream/bin \
+            -DCUSTOM_SHAREDIR=/opt/luanti-upstream/share/luanti \
+            -DCUSTOM_DOCDIR=/opt/luanti-upstream/share/doc/luanti \
+            -DCUSTOM_MANDIR=/opt/luanti-upstream/share/man \
+            -DCUSTOM_EXAMPLE_CONF_DIR=/opt/luanti-upstream/share/luanti \
+            -DCUSTOM_XDG_APPS_DIR=/opt/luanti-upstream/share/applications \
+            -DCUSTOM_ICONDIR=/opt/luanti-upstream/share/icons \
+            -DCUSTOM_LOCALEDIR=/opt/luanti-upstream/share/locale
+
+      - name: Build
+        run: cmake --build build-desktop --parallel 2
+
+      - name: Package DEB
+        run: cpack --config build-desktop/CPackConfig.cmake -G DEB
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/desktop
+
+          pick_one() {
+            local label="$1"
+            shift
+            local path
+            path="$($@ | head -n1 || true)"
+            if [ -z "$path" ]; then
+              echo "ERROR: missing required artifact: $label" >&2
+              echo "Top-level files:" >&2
+              find . -maxdepth 2 -type f | sort >&2
+              echo "build-desktop files:" >&2
+              find build-desktop -type f | sort >&2
+              exit 1
+            fi
+            printf '%s\n' "$path"
+          }
+
+          desktop_deb="$(pick_one 'desktop deb package' find . -type f -name '*.deb')"
+          cp -v "$desktop_deb" "artifacts/desktop/luanti-${{ needs.check-upstream.outputs.version }}.deb"
+
+          rm -rf desktop-deb-root
+          mkdir -p desktop-deb-root
+          dpkg-deb -x "$desktop_deb" desktop-deb-root
+
+          desktop_bin="$(find desktop-deb-root -type f \
+            \( -name 'luanti' -o -name 'minetest' \) | head -n1 || true)"
+
+          if [ -n "$desktop_bin" ]; then
+            preferred="$(find desktop-deb-root -type f \
+              \( -name 'luanti' -o -name 'minetest' \) \
+              | rg '/usr/(local/)?(bin|games)/' | head -n1 || true)"
+            if [ -n "$preferred" ]; then
+              desktop_bin="$preferred"
+            fi
+          fi
+
+          if [ -z "$desktop_bin" ]; then
+            echo "ERROR: desktop executable not found inside desktop deb" >&2
+            find desktop-deb-root -type f | sort >&2
+            exit 1
+          fi
+
+          cp -v "$desktop_bin" artifacts/desktop/luanti
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: luanti-desktop-${{ needs.check-upstream.outputs.version }}-linux
+          path: artifacts/desktop
+          if-no-files-found: error
+
+  publish-release:
+    name: Create/update release and upload assets
+    runs-on: ubuntu-22.04
+    needs: [check-upstream, build-server, build-desktop]
+    if: needs.check-upstream.outputs.should_build == 'true'
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.check-upstream.outputs.version }}"
+          title="$tag"
+          notes='automated via github workflow!'
+
+          if gh release view "$tag" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit "$tag" -R "${{ github.repository }}" --title "$title" --notes "$notes"
+          else
+            gh release create "$tag" -R "${{ github.repository }}" --title "$title" --notes "$notes"
+          fi
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.check-upstream.outputs.version }}"
+
+          gh release upload "$tag" -R "${{ github.repository }}" \
+            release-assets/luanti-server-*/luantiserver \
+            release-assets/luanti-desktop-*/luanti \
+            release-assets/luanti-desktop-*/luanti-${{ needs.check-upstream.outputs.version }}.deb \
+            --clobber
+
+  already-up-to-date:
+    name: Skip (already released)
+    runs-on: ubuntu-22.04
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build != 'true'
+
+    steps:
+      - name: Print skip reason
+        run: |
+          echo "No new upstream version to build."
+          echo "Latest checked version: ${{ needs.check-upstream.outputs.version }}"
+          echo "Tip: use workflow_dispatch with force=true to rerun manually."
